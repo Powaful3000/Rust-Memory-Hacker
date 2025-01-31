@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicUsize, Ordering, AtomicBool};
 use std::sync::Mutex;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
-use tokio::sync::watch;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use winapi::shared::minwindef::DWORD;
@@ -345,44 +344,104 @@ impl MemoryScanner {
         results: &mut HashMap<usize, Vec<u8>>,
         stats: &ScanStats,
     ) -> Result<()> {
+        debug!("Scanning region at {:#x} with size {} bytes", address, size);
+        debug!("Protection flags: {:#x}", self.get_region_permissions(address)?);
+        debug!("Data type: {:?}, Scan type: {:?}", data_type, scan_type);
+
         const CHUNK_SIZE: usize = 4096;
         let mut buffer = vec![0u8; std::cmp::min(CHUNK_SIZE, size)];
 
         for chunk_start in (0..size).step_by(CHUNK_SIZE) {
             let chunk_size = std::cmp::min(CHUNK_SIZE, size - chunk_start);
+            let chunk_addr = address + chunk_start;
             buffer.resize(chunk_size, 0);
             
-            match self.read_memory_raw(address + chunk_start, &mut buffer) {
+            debug!("Scanning chunk at {:#x} with size {} bytes", chunk_addr, chunk_size);
+            
+            match self.read_memory_raw(chunk_addr, &mut buffer) {
                 Ok(_) => {
+                    let matches_before = results.len();
                     for offset in (0..chunk_size).step_by(data_type.size()) {
                         if offset + data_type.size() > chunk_size {
                             break;
                         }
 
-                        let addr = address + chunk_start + offset;
+                        let addr = chunk_addr + offset;
                         let current = &buffer[offset..offset + data_type.size()];
 
-                        match scan_type {
-                            ScanType::ExactValue if current == value => {
-                                results.insert(addr, current.to_vec());
-                                stats.matches_found.fetch_add(1, Ordering::Relaxed);
-                            },
+                        if let Some(comparison_result) = self.compare_bytes(current, value, data_type) {
+                            debug!("Value comparison at {:#x}: {:?}", addr, comparison_result);
+                        }
+
+                        let matches = match scan_type {
+                            ScanType::ExactValue => current == value,
                             ScanType::Changed => {
                                 if let Some(prev_map) = previous_results {
                                     if let Some(old) = prev_map.get(&addr) {
-                                        if current != old {
-                                            results.insert(addr, current.to_vec());
-                                            stats.matches_found.fetch_add(1, Ordering::Relaxed);
-                                        }
+                                        current != old
+                                    } else {
+                                        false
                                     }
+                                } else {
+                                    false
                                 }
                             },
-                            _ => {}
+                            ScanType::Increased => {
+                                if let (Some(prev_map), Some(comparison)) = (previous_results, self.compare_bytes(current, value, data_type)) {
+                                    if let Some(old) = prev_map.get(&addr) {
+                                        if let Some(old_comparison) = self.compare_bytes(old, value, data_type) {
+                                            comparison.is_greater
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            },
+                            ScanType::Decreased => {
+                                if let (Some(prev_map), Some(comparison)) = (previous_results, self.compare_bytes(current, value, data_type)) {
+                                    if let Some(old) = prev_map.get(&addr) {
+                                        if let Some(old_comparison) = self.compare_bytes(old, value, data_type) {
+                                            comparison.is_less
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            },
+                            ScanType::Unchanged => {
+                                if let Some(prev_map) = previous_results {
+                                    if let Some(old) = prev_map.get(&addr) {
+                                        current == old
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            },
+                        };
+
+                        if matches {
+                            results.insert(addr, current.to_vec());
                         }
                     }
+                    
+                    let new_matches = results.len() - matches_before;
+                    if new_matches > 0 {
+                        debug!("Found {} matches in chunk at {:#x}", new_matches, chunk_addr);
+                    }
+                    stats.matches_found.fetch_add(new_matches, Ordering::Relaxed);
                 },
                 Err(e) => {
-                    debug!("Failed to read chunk at {:#x}: {}", address + chunk_start, e);
+                    debug!("Failed to read chunk at {:#x}: {}", chunk_addr, e);
                     stats.errors.read_errors.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -573,22 +632,15 @@ impl MemoryScanner {
     }
 
     fn get_cached_region(&self, address: usize) -> Option<MemoryRegionInfo> {
-        let mut cache = self.region_cache.lock().unwrap();
-        if cache.is_stale() {
-            if let Ok(()) = self.refresh_region_cache() {
-                return cache.regions.range(..=address).next_back()
-                    .filter(|(start, region)| {
-                        address >= **start && address < **start + region.size
-                    })
-                    .map(|(_, region)| region.clone());
-            }
-            return None;
+        let cache = self.region_cache.lock().unwrap();
+        if cache.validate_cache() {
+            return cache.regions.range(..=address).next_back()
+                .filter(|(start, region)| {
+                    address >= **start && address < **start + region.size
+                })
+                .map(|(_, region)| region.clone());
         }
-        cache.regions.range(..=address).next_back()
-            .filter(|(start, region)| {
-                address >= **start && address < **start + region.size
-            })
-            .map(|(_, region)| region.clone())
+        None
     }
 
     fn refresh_region_cache(&self) -> Result<()> {
@@ -599,6 +651,7 @@ impl MemoryScanner {
     }
 
     pub async fn scan_with_options(&self, options: ScanOptions) -> Result<HashMap<usize, Vec<u8>>> {
+        let options = options;
         options.validate()?;
         debug!("Starting memory scan with {:?} for type {:?}", 
             options.scan_type, options.data_type);
@@ -666,23 +719,40 @@ impl MemoryScanner {
         Ok(results)
     }
 
-    fn compare_bytes(&self, a: &[u8], b: &[u8], data_type: DataType) -> Option<std::cmp::Ordering> {
-        if a.len() != b.len() || a.len() != data_type.size() {
+    fn compare_bytes(&self, current: &[u8], value: &[u8], data_type: DataType) -> Option<ComparisonResult> {
+        if current.len() != value.len() {
+            debug!("Size mismatch in comparison: current={}, value={}", current.len(), value.len());
             return None;
         }
 
         match data_type {
-            DataType::U8 => u8::from_ne_bytes(a.try_into().ok()?).partial_cmp(&u8::from_ne_bytes(b.try_into().ok()?)),
-            DataType::U16 => u16::from_ne_bytes(a.try_into().ok()?).partial_cmp(&u16::from_ne_bytes(b.try_into().ok()?)),
-            DataType::U32 => u32::from_ne_bytes(a.try_into().ok()?).partial_cmp(&u32::from_ne_bytes(b.try_into().ok()?)),
-            DataType::U64 => u64::from_ne_bytes(a.try_into().ok()?).partial_cmp(&u64::from_ne_bytes(b.try_into().ok()?)),
-            DataType::I8 => i8::from_ne_bytes(a.try_into().ok()?).partial_cmp(&i8::from_ne_bytes(b.try_into().ok()?)),
-            DataType::I16 => i16::from_ne_bytes(a.try_into().ok()?).partial_cmp(&i16::from_ne_bytes(b.try_into().ok()?)),
-            DataType::I32 => i32::from_ne_bytes(a.try_into().ok()?).partial_cmp(&i32::from_ne_bytes(b.try_into().ok()?)),
-            DataType::I64 => i64::from_ne_bytes(a.try_into().ok()?).partial_cmp(&i64::from_ne_bytes(b.try_into().ok()?)),
-            DataType::F32 => f32::from_ne_bytes(a.try_into().ok()?).partial_cmp(&f32::from_ne_bytes(b.try_into().ok()?)),
-            DataType::F64 => f64::from_ne_bytes(a.try_into().ok()?).partial_cmp(&f64::from_ne_bytes(b.try_into().ok()?)),
+            DataType::U8 => self.compare_numeric::<u8>(current, value),
+            DataType::U16 => self.compare_numeric::<u16>(current, value),
+            DataType::U32 => self.compare_numeric::<u32>(current, value),
+            DataType::U64 => self.compare_numeric::<u64>(current, value),
+            DataType::I8 => self.compare_numeric::<i8>(current, value),
+            DataType::I16 => self.compare_numeric::<i16>(current, value),
+            DataType::I32 => self.compare_numeric::<i32>(current, value),
+            DataType::I64 => self.compare_numeric::<i64>(current, value),
+            DataType::F32 => self.compare_numeric::<f32>(current, value),
+            DataType::F64 => self.compare_numeric::<f64>(current, value),
         }
+    }
+
+    fn compare_numeric<T>(&self, current: &[u8], value: &[u8]) -> Option<ComparisonResult> 
+    where
+        T: Copy + PartialOrd + FromBytes + std::fmt::Debug,
+    {
+        let current_val = T::from_bytes(current)?;
+        let value_val = T::from_bytes(value)?;
+
+        Some(ComparisonResult {
+            is_equal: current_val == value_val,
+            is_greater: current_val > value_val,
+            is_less: current_val < value_val,
+            current_value: format!("{:?}", current_val),
+            target_value: format!("{:?}", value_val),
+        })
     }
 
     fn calculate_total_memory(&self) -> Result<usize> {
@@ -746,11 +816,10 @@ impl MemoryScanner {
     }
 
     fn read_memory_raw(&self, address: usize, buffer: &mut [u8]) -> Result<()> {
-        // Add validation before reading
         self.validate_address(address, buffer.len())?;
-        
-        let bytes_read = &mut 0;
+        self.validate_memory_region(address, buffer.len())?;
 
+        let bytes_read = &mut 0;
         let success = unsafe {
             ReadProcessMemory(
                 self.process_handle.0,
@@ -762,10 +831,15 @@ impl MemoryScanner {
         };
 
         if success == 0 {
-            return Err(MemoryError::MemoryOperation(format!(
-                "Failed to read raw memory at address: {:#x}",
-                address
-            )));
+            let error_code = unsafe { winapi::um::errhandlingapi::GetLastError() };
+            debug!("ReadProcessMemory failed at {:#x}: error code {}", address, error_code);
+            return Err(MemoryError::MemoryOperation(
+                format!("Failed to read memory at {:#x} (Error code: {})", address, error_code)
+            ));
+        }
+
+        if *bytes_read != buffer.len() {
+            debug!("Partial read at {:#x}: {} of {} bytes", address, bytes_read, buffer.len());
         }
 
         Ok(())
@@ -792,6 +866,25 @@ impl MemoryScanner {
                 "Failed to write raw memory at address: {:#x}",
                 address
             )));
+        }
+
+        Ok(())
+    }
+
+    fn validate_memory_region(&self, address: usize, size: usize) -> Result<()> {
+        let region = self.get_memory_region(address)?;
+        
+        if !self.is_readable_region(region.protection) {
+            debug!("Region at {:#x} is not readable (protection: {:#x})", 
+                address, region.protection);
+            return Err(MemoryError::InvalidProtection(address));
+        }
+
+        if address + size > region.base_address + region.size {
+            debug!("Access would cross region boundary at {:#x}", address);
+            return Err(MemoryError::MemoryOperation(
+                format!("Memory access would cross region boundary at {:#x}", address)
+            ));
         }
 
         Ok(())
@@ -851,11 +944,17 @@ impl RegionCache {
         }
     }
 
-    fn is_stale(&self) -> bool {
-        self.last_update.elapsed() > Self::CACHE_DURATION
+    fn validate_cache(&self) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.last_update) > Duration::from_secs(1) {
+            debug!("Region cache is stale, needs refresh");
+            return false;
+        }
+        true
     }
 
     fn update(&mut self, regions: Vec<MemoryRegionInfo>) {
+        debug!("Updating region cache with {} regions", regions.len());
         self.regions.clear();
         for region in regions {
             self.regions.insert(region.base_address, region);
@@ -1040,14 +1139,11 @@ impl MemoryScanner {
         options: ScanOptions,
         checkpoint: ScanCheckpoint,
     ) -> Result<HashMap<usize, Vec<u8>>> {
-        let mut modified_options = options;
-        // Start from the last scanned address
+        let options = options;
         let mut results = checkpoint.results;
         
-        // Modify the scan to start from checkpoint
-        let results_from_checkpoint = self.scan_with_options(modified_options).await?;
+        let results_from_checkpoint = self.scan_with_options(options).await?;
         
-        // Merge results
         results.extend(results_from_checkpoint);
         
         Ok(results)
@@ -1079,5 +1175,36 @@ impl ScanOptions {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ComparisonResult {
+    is_equal: bool,
+    is_greater: bool,
+    is_less: bool,
+    current_value: String,
+    target_value: String,
+}
+
+trait FromBytes {
+    fn from_bytes(bytes: &[u8]) -> Option<Self>
+    where
+        Self: Sized;
+}
+
+impl<T> FromBytes for T
+where
+    T: Copy,
+{
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != std::mem::size_of::<T>() {
+            return None;
+        }
+        let mut data = Vec::with_capacity(std::mem::size_of::<T>());
+        data.extend_from_slice(bytes);
+        Some(unsafe { 
+            *(data.as_ptr() as *const T)
+        })
     }
 } 

@@ -1,5 +1,7 @@
 use thiserror::Error;
 use tokio::task::JoinError;
+use std::num::{ParseIntError, ParseFloatError};
+use dialoguer;
 
 #[derive(Error, Debug)]
 pub enum MemoryError {
@@ -23,6 +25,15 @@ pub enum MemoryError {
     
     #[error("Task join error: {0}")]
     JoinError(#[from] JoinError),
+
+    #[error("Dialog error: {0}")]
+    DialogError(#[from] dialoguer::Error),
+
+    #[error("Integer parse error: {0}")]
+    ParseIntError(#[from] ParseIntError),
+
+    #[error("Float parse error: {0}")]
+    ParseFloatError(#[from] ParseFloatError),
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>; 
