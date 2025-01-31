@@ -162,10 +162,9 @@ impl Menu {
         if let Some((_, scanner)) = &self.current_process {
             let scanner = scanner.clone();
             
-            // Add data type selection
             let data_type_choices = vec![
                 "U8 (Unsigned 8-bit)",
-                "U16 (Unsigned 16-bit)",
+                "U16 (Unsigned 16-bit)", 
                 "U32 (Unsigned 32-bit)",
                 "U64 (Unsigned 64-bit)",
                 "I8 (Signed 8-bit)",
@@ -179,8 +178,7 @@ impl Menu {
             let data_type = match Select::with_theme(&ColorfulTheme::default())
                 .with_prompt("Select data type")
                 .items(&data_type_choices)
-                .interact()
-                .map_err(MemoryError::from)?
+                .interact()? 
             {
                 0 => DataType::U8,
                 1 => DataType::U16,
@@ -192,88 +190,41 @@ impl Menu {
                 7 => DataType::I64,
                 8 => DataType::F32,
                 9 => DataType::F64,
-                _ => return Err(MemoryError::MemoryOperation("Invalid data type selection".to_string())),
+                _ => return Err(MemoryError::MemoryOperation("Invalid data type".to_string())),
             };
 
-            // Add scan type selection
-            let scan_type_choices = vec![
-                "Exact Value",
-                "Changed Value",
-                "Increased Value",
-                "Decreased Value",
-                "Unchanged Value",
-            ];
+            let value_str: String = Input::new()
+                .with_prompt("Enter value to scan for")
+                .interact_text()?;
 
-            let scan_type = match Select::with_theme(&ColorfulTheme::default())
-                .with_prompt("Select scan type")
-                .items(&scan_type_choices)
-                .interact()
-                .map_err(MemoryError::from)?
-            {
-                0 => ScanType::ExactValue,
-                1 => ScanType::Changed,
-                2 => ScanType::Increased,
-                3 => ScanType::Decreased,
-                4 => ScanType::Unchanged,
-                _ => return Err(MemoryError::MemoryOperation("Invalid scan type selection".to_string())),
-            };
-
-            let value: String = Input::new()
-                .with_prompt("Enter value")
-                .interact_text()
-                .map_err(|_| MemoryError::MemoryOperation("Invalid input".to_string()))?;
-
-            // Convert value based on selected data type
             let value_bytes = match data_type {
-                DataType::U8 => value.parse::<u8>()
-                    .map_err(MemoryError::from)?
-                    .to_ne_bytes().to_vec(),
-                DataType::U16 => value.parse::<u16>()
-                    .map_err(MemoryError::from)?
-                    .to_ne_bytes().to_vec(),
-                DataType::U32 => value.parse::<u32>()
-                    .map_err(MemoryError::from)?
-                    .to_ne_bytes().to_vec(),
-                DataType::U64 => value.parse::<u64>()
-                    .map_err(MemoryError::from)?
-                    .to_ne_bytes().to_vec(),
-                DataType::I8 => value.parse::<i8>()
-                    .map_err(MemoryError::from)?
-                    .to_ne_bytes().to_vec(),
-                DataType::I16 => value.parse::<i16>()
-                    .map_err(MemoryError::from)?
-                    .to_ne_bytes().to_vec(),
-                DataType::I32 => value.parse::<i32>()
-                    .map_err(MemoryError::from)?
-                    .to_ne_bytes().to_vec(),
-                DataType::I64 => value.parse::<i64>()
-                    .map_err(MemoryError::from)?
-                    .to_ne_bytes().to_vec(),
-                DataType::F32 => value.parse::<f32>()
-                    .map_err(MemoryError::from)?
-                    .to_ne_bytes().to_vec(),
-                DataType::F64 => value.parse::<f64>()
-                    .map_err(MemoryError::from)?
-                    .to_ne_bytes().to_vec(),
+                DataType::U8 => value_str.parse::<u8>()?.to_ne_bytes().to_vec(),
+                DataType::U16 => value_str.parse::<u16>()?.to_ne_bytes().to_vec(),
+                DataType::U32 => value_str.parse::<u32>()?.to_ne_bytes().to_vec(),
+                DataType::U64 => value_str.parse::<u64>()?.to_ne_bytes().to_vec(),
+                DataType::I8 => value_str.parse::<i8>()?.to_ne_bytes().to_vec(),
+                DataType::I16 => value_str.parse::<i16>()?.to_ne_bytes().to_vec(),
+                DataType::I32 => value_str.parse::<i32>()?.to_ne_bytes().to_vec(),
+                DataType::I64 => value_str.parse::<i64>()?.to_ne_bytes().to_vec(),
+                DataType::F32 => value_str.parse::<f32>()?.to_ne_bytes().to_vec(),
+                DataType::F64 => value_str.parse::<f64>()?.to_ne_bytes().to_vec(),
             };
 
-            let results = scanner.scan_memory(
+            let scan_results = scanner.scan_memory(
                 value_bytes,
-                scan_type,
+                ScanType::ExactValue,
                 data_type,
                 None
             ).await?;
 
-            let results_len = results.len();
+            let results_len = scan_results.len();
             self.active_scan = Some(MemoryScan {
-                scan_type,
+                scan_type: ScanType::ExactValue,
                 data_type,
-                results,
+                results: scan_results,
             });
 
             info!("Found {} matches", results_len);
-        } else {
-            error!("No process selected!");
         }
         Ok(())
     }
