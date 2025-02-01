@@ -87,45 +87,6 @@ impl Menu {
         Ok(())
     }
 
-    async fn read_memory(&self) -> Result<()> {
-        if let Some((_, scanner)) = &self.current_process {
-            let address: usize = Input::new()
-                .with_prompt("Enter memory address (hex)")
-                .interact_text()
-                .map_err(|_| MemoryError::InvalidAddress(0))?;
-
-            match scanner.read_memory::<u32>(address) {
-                Ok(value) => info!("Value at {:#x}: {}", address, value),
-                Err(e) => error!("Failed to read memory: {}", e),
-            }
-        } else {
-            error!("No process selected!");
-        }
-        Ok(())
-    }
-
-    async fn write_memory(&self) -> Result<()> {
-        if let Some((_, scanner)) = &self.current_process {
-            let address: usize = Input::new()
-                .with_prompt("Enter memory address (hex)")
-                .interact_text()
-                .map_err(|_| MemoryError::InvalidAddress(0))?;
-
-            let value: u32 = Input::new()
-                .with_prompt("Enter value")
-                .interact_text()
-                .map_err(|_| MemoryError::MemoryOperation("Invalid value".to_string()))?;
-
-            match scanner.write_memory(address, &value) {
-                Ok(_) => info!("Successfully wrote {} to {:#x}", value, address),
-                Err(e) => error!("Failed to write memory: {}", e),
-            }
-        } else {
-            error!("No process selected!");
-        }
-        Ok(())
-    }
-
     async fn memory_scanner_menu(&mut self) -> Result<()> {
         if self.current_process.is_none() {
             error!("No process selected!");

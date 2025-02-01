@@ -8,7 +8,6 @@ use winapi::um::errhandlingapi::GetLastError;
 
 pub struct Process {
     handle: HANDLE,
-    pid: u32,
 }
 
 impl Process {
@@ -34,7 +33,7 @@ impl Process {
             });
         }
 
-        Ok(Self { handle, pid })
+        Ok(Self { handle })
     }
 
     pub fn handle(&self) -> HANDLE {

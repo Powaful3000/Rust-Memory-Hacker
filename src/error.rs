@@ -17,6 +17,7 @@ pub enum MemoryError {
     #[error("Memory alignment error at address {0:x}: required alignment {1}")]
     AlignmentError(usize, usize),
     
+    #[allow(dead_code)]
     #[error("Invalid memory protection at address {0:x}")]
     InvalidProtection(usize),
     
