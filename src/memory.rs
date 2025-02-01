@@ -1,7 +1,7 @@
 use crate::error::{MemoryError, Result};
 use std::mem;
 use winapi::um::memoryapi::{ReadProcessMemory, WriteProcessMemory, VirtualQueryEx};
-use winapi::um::winnt::{HANDLE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_NOACCESS, PAGE_GUARD, MEM_COMMIT};
+use winapi::um::winnt::{HANDLE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_NOACCESS, PAGE_GUARD, MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE};
 use winapi::um::errhandlingapi::GetLastError;
 use std::collections::HashMap;
 use tokio::task;
@@ -80,6 +80,7 @@ pub struct MemoryRegionInfo {
     pub size: usize,
     pub protection: u32,
     pub state: u32,
+    pub type_: u32,
 }
 
 #[derive(Debug)]
@@ -496,25 +497,31 @@ impl MemoryScanner {
         results: &mut HashMap<usize, Vec<u8>>,
         stats: &ScanStats,
     ) -> Result<()> {
-        debug!("Scanning region at {:#x} size {} type {:?}", base_addr, size, scan_type);
+        // Log only at start of region
+        debug!("Scanning region at {:#x} size {}", base_addr, size);
+        
         let type_size = data_type.size();
-        let mut current_addr = base_addr;
-        let end_addr = base_addr + size;
+        let aligned_start = (base_addr + data_type.alignment() - 1) & !(data_type.alignment() - 1);
+        let end_addr = base_addr.checked_add(size)
+            .ok_or_else(|| MemoryError::MemoryOperation("Address overflow".to_string()))?;
+
+        let mut current_addr = aligned_start;
+        let mut matches_in_region = 0;
 
         while current_addr + type_size <= end_addr {
-            if let Ok(current) = self.read_value(current_addr, data_type) {
+            if let Ok(current_value) = self.safe_read_memory(current_addr, type_size, stats) {
                 let matches = match scan_type {
                     ScanType::ExactValue => {
-                        let is_match = current == *target_value;
-                        if is_match {
-                            debug!("Found exact match at {:#x}", current_addr);
+                        if current_value.len() == target_value.len() {
+                            current_value == target_value
+                        } else {
+                            false
                         }
-                        is_match
                     },
                     ScanType::Changed | ScanType::Unchanged => {
                         if let Some(prev_map) = previous_results {
                             prev_map.get(&current_addr).map_or(false, |old| {
-                                let changed = current != *old;
+                                let changed = current_value != *old;
                                 if scan_type == ScanType::Changed { changed } else { !changed }
                             })
                         } else {
@@ -524,11 +531,11 @@ impl MemoryScanner {
                     ScanType::Increased | ScanType::Decreased => {
                         if let Some(prev_map) = previous_results {
                             if let Some(old) = prev_map.get(&current_addr) {
-                                self.compare_typed_value(&current, old, data_type)
-                                    .map_or(false, |r| {
+                                self.compare_values(&current_value, old, data_type)
+                                    .map_or(false, |comparison| {
                                         match scan_type {
-                                            ScanType::Increased => r.is_greater,
-                                            ScanType::Decreased => r.is_less,
+                                            ScanType::Increased => comparison > 0,
+                                            ScanType::Decreased => comparison < 0,
                                             _ => false,
                                         }
                                     })
@@ -542,30 +549,69 @@ impl MemoryScanner {
                 };
 
                 if matches {
-                    results.insert(current_addr, current);
-                    stats.matches_found.fetch_add(1, Ordering::Relaxed);
+                    results.insert(current_addr, current_value);
+                    matches_in_region += 1;
+                    // Log matches in batches
+                    if matches_in_region % 100 == 0 {
+                        debug!("Found {} matches in region {:#x}", matches_in_region, base_addr);
+                    }
                 }
             }
+            
             current_addr += type_size;
         }
 
-        debug!("Completed region scan, found {} matches", 
-            stats.matches_found.load(Ordering::Relaxed));
+        // Log region completion only if matches were found
+        if matches_in_region > 0 {
+            debug!("Completed region {:#x} scan, found {} matches", base_addr, matches_in_region);
+        }
+        
         Ok(())
     }
 
-    fn compare_typed_value(&self, current: &[u8], target: &[u8], data_type: DataType) -> Option<ComparisonResult> {
+    fn compare_values(&self, current: &[u8], previous: &[u8], data_type: DataType) -> Option<i32> {
+        if current.len() != previous.len() {
+            return None;
+        }
+
         match data_type {
-            DataType::U8 => u8::compare_values(current, target),
-            DataType::U16 => u16::compare_values(current, target),
-            DataType::U32 => u32::compare_values(current, target),
-            DataType::U64 => u64::compare_values(current, target),
-            DataType::I8 => i8::compare_values(current, target),
-            DataType::I16 => i16::compare_values(current, target),
-            DataType::I32 => i32::compare_values(current, target),
-            DataType::I64 => i64::compare_values(current, target),
-            DataType::F32 => f32::compare_values(current, target),
-            DataType::F64 => f64::compare_values(current, target),
+            DataType::U8 => {
+                let curr = u8::from_ne_bytes(current.try_into().ok()?);
+                let prev = u8::from_ne_bytes(previous.try_into().ok()?);
+                Some((curr as i32).cmp(&(prev as i32)) as i32)
+            },
+            DataType::U16 => {
+                let curr = u16::from_ne_bytes(current.try_into().ok()?);
+                let prev = u16::from_ne_bytes(previous.try_into().ok()?);
+                Some((curr as i32).cmp(&(prev as i32)) as i32)
+            },
+            DataType::U32 => {
+                let curr = u32::from_ne_bytes(current.try_into().ok()?);
+                let prev = u32::from_ne_bytes(previous.try_into().ok()?);
+                Some((curr as i64).cmp(&(prev as i64)) as i32)
+            },
+            DataType::I8 => {
+                let curr = i8::from_ne_bytes(current.try_into().ok()?);
+                let prev = i8::from_ne_bytes(previous.try_into().ok()?);
+                Some(curr.cmp(&prev) as i32)
+            },
+            DataType::I16 => {
+                let curr = i16::from_ne_bytes(current.try_into().ok()?);
+                let prev = i16::from_ne_bytes(previous.try_into().ok()?);
+                Some(curr.cmp(&prev) as i32)
+            },
+            DataType::I32 => {
+                let curr = i32::from_ne_bytes(current.try_into().ok()?);
+                let prev = i32::from_ne_bytes(previous.try_into().ok()?);
+                Some(curr.cmp(&prev) as i32)
+            },
+            DataType::F32 => {
+                let curr = f32::from_ne_bytes(current.try_into().ok()?);
+                let prev = f32::from_ne_bytes(previous.try_into().ok()?);
+                Some(curr.partial_cmp(&prev)? as i32)
+            },
+            // Add other types as needed...
+            _ => None,
         }
     }
 
@@ -662,6 +708,7 @@ impl MemoryScanner {
             size: mbi.RegionSize,
             protection: mbi.Protect,
             state: mbi.State,
+            type_: mbi.Type,
         })
     }
 
@@ -669,16 +716,17 @@ impl MemoryScanner {
         debug!("Starting memory region enumeration");
         let mut regions = Vec::new();
         let mut address = 0usize;
-        let mut region_count = 0;
+        let mut valid_regions = 0;
         
         while let Ok(region) = self.get_memory_region(address) {
-            region_count += 1;
-            if region_count % 100 == 0 {
-                debug!("Enumerated {} regions so far...", region_count);
-            }
-
-            if region.state == MEM_COMMIT {
+            if region.state == MEM_COMMIT && self.is_readable_region(region.protection) {
+                // Log only every 100th region
+                if valid_regions % 100 == 0 {
+                    debug!("Found {} valid regions, current: base={:#x}", 
+                        valid_regions, region.base_address);
+                }
                 regions.push(region.clone());
+                valid_regions += 1;
             }
             
             if let Some(next_addr) = region.base_address.checked_add(region.size) {
@@ -689,7 +737,7 @@ impl MemoryScanner {
             }
         }
         
-        debug!("Memory enumeration complete. Found {} committed regions", regions.len());
+        debug!("Memory enumeration complete. Found {} valid regions", regions.len());
         Ok(regions)
     }
 
@@ -783,29 +831,79 @@ impl MemoryScanner {
         let results = task::spawn_blocking(move || -> Result<HashMap<usize, Vec<u8>>> {
             let mut results = HashMap::new();
             
-            // Get list of all memory regions first
-            debug!("Enumerating memory regions...");
-            let regions = scanner.enumerate_memory_regions()?;
-            debug!("Found {} memory regions to scan", regions.len());
-            
-            for (region_index, region) in regions.iter().enumerate() {
-                if options.cancel.load(Ordering::Relaxed) {
-                    debug!("Scan cancelled");
-                    break;
+            if let Some(previous_results) = options.previous_results {
+                // Next scan mode - only check previous addresses
+                for (address, prev_value) in previous_results {
+                    if options.cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    // Validate memory access
+                    if let Err(_) = scanner.validate_memory_region(address, options.data_type.size()) {
+                        continue;
+                    }
+
+                    // Read current value
+                    match scanner.safe_read_memory(address, options.data_type.size(), &stats_clone) {
+                        Ok(current_value) => {
+                            let matches = match options.scan_type {
+                                ScanType::ExactValue => current_value == target_value,
+                                ScanType::Increased => {
+                                    // Compare as numbers based on data_type
+                                    scanner.compare_values(&current_value, &prev_value, options.data_type)
+                                        .map_or(false, |result| result > 0)
+                                },
+                                ScanType::Decreased => {
+                                    scanner.compare_values(&current_value, &prev_value, options.data_type)
+                                        .map_or(false, |result| result < 0)
+                                },
+                                ScanType::Changed => current_value != prev_value,
+                                ScanType::Unchanged => current_value == prev_value,
+                            };
+
+                            if matches {
+                                results.insert(address, current_value);
+                                stats_clone.matches_found.fetch_add(1, Ordering::Relaxed);
+                            }
+                        },
+                        Err(e) => scanner.handle_read_error(e, address, options.data_type.size(), &stats_clone),
+                    }
+                    
+                    stats_clone.bytes_scanned.fetch_add(options.data_type.size(), Ordering::Relaxed);
                 }
+            } else {
+                // Initial scan - process all regions
+                let regions = scanner.enumerate_memory_regions()?;
+                debug!("Found {} memory regions to scan", regions.len());
+                
+                for (region_index, region) in regions.iter().enumerate() {
+                    if options.cancel.load(Ordering::Relaxed) {
+                        debug!("Scan cancelled");
+                        break;
+                    }
 
-                debug!("Scanning region {}/{}: base={:#x}, size={}, protection={:#x}", 
-                    region_index + 1, regions.len(), region.base_address, region.size, region.protection);
+                    // Skip image regions
+                    if region.type_ == MEM_IMAGE {
+                        debug!("Skipping image region {}/{} at {:#x}", 
+                            region_index + 1, regions.len(), region.base_address);
+                        continue;
+                    }
 
-                // R1's critical fix: Proper protection and state checking
-                if region.state == MEM_COMMIT {
-                    let protection = region.protection;
+                    // Use region_index for progress updates
+                    if region_index % 10 == 0 {
+                        if let Some(handler) = progress_handler.as_ref() {
+                            let progress = ScanProgressUpdate {
+                                regions_scanned: region_index,
+                                bytes_scanned: stats_clone.bytes_scanned.load(Ordering::Relaxed),
+                                matches_found: stats_clone.matches_found.load(Ordering::Relaxed),
+                                current_address: region.base_address,
+                                total_memory,
+                            };
+                            let _ = handler.update(progress);
+                        }
+                    }
 
-                    // Enhanced protection check as per R1's guidance
-                    if protection & PAGE_GUARD == 0 
-                       && protection & PAGE_NOACCESS == 0 
-                       && scanner.is_readable_region(protection) 
-                    {
+                    if region.state == MEM_COMMIT && scanner.is_readable_region(region.protection) {
                         let type_size = options.data_type.size();
                         let alignment = options.data_type.alignment();
                         const CHUNK_SIZE: usize = 4096;
@@ -816,61 +914,35 @@ impl MemoryScanner {
 
                         if offset < region.size {
                             let adjusted_size = region.size - offset;
-                            let chunk_count = (adjusted_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
-                            debug!("Processing {} chunks in region", chunk_count);
                             
-                            for (chunk_index, chunk_offset) in (0..adjusted_size).step_by(CHUNK_SIZE).enumerate() {
+                            for chunk_offset in (0..adjusted_size).step_by(CHUNK_SIZE) {
                                 let chunk_addr = aligned_start + chunk_offset;
                                 let chunk_size = std::cmp::min(CHUNK_SIZE, adjusted_size - chunk_offset);
-                                
-                                if chunk_index % 1000 == 0 {
-                                    debug!("Processing chunk {}/{} at address {:#x}", 
-                                        chunk_index + 1, chunk_count, chunk_addr);
-                                }
 
-                                // Validate memory access before reading
                                 if let Ok(()) = scanner.validate_memory_region(chunk_addr, chunk_size) {
-                                    match scanner.safe_read_memory(chunk_addr, chunk_size, &stats_clone) {
-                                        Ok(current_data) => {
-                                            if let Err(e) = scanner.scan_region(
-                                                chunk_addr,
-                                                chunk_size,
-                                                &target_value,
-                                                options.data_type,
-                                                options.scan_type,
-                                                options.previous_results.as_ref(),
-                                                &mut results,
-                                                &stats_clone
-                                            ) {
-                                                debug!("Error scanning chunk at {:#x}: {}", chunk_addr, e);
-                                                stats_clone.errors.read_errors.fetch_add(1, Ordering::Relaxed);
+                                    if let Ok(current_data) = scanner.safe_read_memory(chunk_addr, chunk_size, &stats_clone) {
+                                        // Scan the chunk for matches
+                                        for offset in (0..chunk_size).step_by(type_size) {
+                                            if chunk_addr + offset + type_size <= chunk_addr + chunk_size {
+                                                let value_slice = &current_data[offset..offset + type_size];
+                                                if value_slice == target_value {
+                                                    results.insert(chunk_addr + offset, value_slice.to_vec());
+                                                    stats_clone.matches_found.fetch_add(1, Ordering::Relaxed);
+                                                }
                                             }
-                                        },
-                                        Err(e) => {
-                                            debug!("Failed to read chunk at {:#x}: {}", chunk_addr, e);
-                                            stats_clone.errors.read_errors.fetch_add(1, Ordering::Relaxed);
                                         }
                                     }
                                 }
-
-                                // Update stats with the single implementation
-                                scanner.update_scan_stats(&stats_clone, chunk_size, results.len());
-
-                                if options.cancel.load(Ordering::Relaxed) {
-                                    debug!("Scan cancelled during chunk processing");
-                                    break;
-                                }
+                                
+                                stats_clone.bytes_scanned.fetch_add(chunk_size, Ordering::Relaxed);
                             }
                         }
-                    } else {
-                        debug!("Skipping region due to protection flags: {:#x}", protection);
                     }
-                } else {
-                    debug!("Skipping region: not committed memory");
+                    
+                    stats_clone.regions_scanned.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            
-            debug!("Scan completed. Found {} matches", results.len());
+
             Ok(results)
         }).await??;
 
@@ -1002,6 +1074,13 @@ impl MemoryScanner {
     fn validate_memory_region(&self, address: usize, size: usize) -> Result<()> {
         let region = self.get_memory_region(address)?;
         
+        // Check if region is an image (DLL/executable) section
+        if region.type_ == MEM_IMAGE {
+            return Err(MemoryError::MemoryOperation(
+                format!("Memory at {:#x} is in image section", address)
+            ));
+        }
+        
         // Check if address is within region bounds
         if address < region.base_address || 
            address + size > region.base_address + region.size {
@@ -1083,8 +1162,8 @@ impl MemoryScanner {
     }
 
     fn safe_read_memory(&self, address: usize, size: usize, stats: &ScanStats) -> Result<Vec<u8>> {
-        debug!("Attempting to read memory at {:#x} size {}", address, size);
         let mut buffer = vec![0u8; size];
+        
         let result = unsafe {
             ReadProcessMemory(
                 self.process_handle.0,
@@ -1097,14 +1176,14 @@ impl MemoryScanner {
 
         if result == 0 {
             let error = unsafe { GetLastError() };
-            debug!("ReadProcessMemory failed at {:#x}: error {}", address, error);
+            // Only log read errors
+            debug!("Memory read failed at {:#x}: error {}", address, error);
             stats.errors.read_errors.fetch_add(1, Ordering::Relaxed);
             return Err(MemoryError::MemoryOperation(
                 format!("Failed to read memory at {:#x}: error {}", address, error)
             ));
         }
 
-        debug!("Successfully read {} bytes from {:#x}", size, address);
         Ok(buffer)
     }
 }
